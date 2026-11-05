@@ -7,20 +7,51 @@ sdk: docker
 app_port: 8501
 pinned: false
 license: mit
-short_description: Clinical medical image interpreter powered by Gemini vision
+short_description: Clinical medical image interpreter by Dr. Shantanu Samanta
 ---
 
-# 🏥 MediScan AI
+# 🩺 MediScan AI
+**Designed & developed by Dr. Shantanu Samanta** · © 2026
 
-Upload a medical image (X-ray, CT, MRI, ECG, EEG, ultrasound, histopathology…), optionally add
-clinical history, and get a structured clinical report: image identification, technical quality,
-systematic findings, impression, differential diagnosis with probabilities, recommendations with
-an urgency rating, and an AI confidence score. Download it as a PDF.
+Upload a medical image (X-ray, CT, MRI, ECG, EEG, ultrasound, fundus, histopathology…), choose the
+modality, optionally add clinical history, and get a structured clinical report: identification,
+technical quality, a systematic findings table, critical findings, pertinent negatives, impression,
+differential diagnosis by likelihood tier, recommendations with an urgency level, and a self-rated
+confidence. Download it as a branded PDF.
 
 > ⚠️ **Research and educational use only.** This is not a medical device and not a substitute for
 > a licensed radiologist or specialist. Never act on AI output without qualified physician review.
 
+## How the report is made more reliable
+
+| What | Why |
+|---|---|
+| **Structured JSON output** (response schema) | Urgency, confidence and differentials are fields, not guessed from keywords — "no emergency intervention required" can no longer show as EMERGENCY. |
+| **No invented measurements** | Sizes in mm/cm only when a scale, caliper or printed value is visible; otherwise relative size. JPEG/PNG exports carry no pixel spacing. |
+| **Likelihood tiers, not percentages** | Most likely / Likely / Possible / Less likely / Must exclude, each with features for and against. LLM percentages are not calibrated. |
+| **Modality checklists** | Choosing CXR, ECG, fundus, CT, MRI, EEG etc. gives the model a specialist review checklist (e.g. ECG calibration, rate, rhythm, axis, intervals, ST by lead). |
+| **Google's recommended sampling** | Gemini 3+ runs at the default temperature with thinking on; forcing temperature 0 can degrade reasoning. |
+| **Truncation detection** | A report cut off by the output limit or a safety stop is flagged, never shown as complete. |
+| **Optional blind read** | Reads the image without history first, then integrates history and shows what changed — reduces anchoring bias (2 requests). |
+| **Image preparation** | EXIF rotation honoured and metadata stripped, 16-bit greyscale windowed, downscaled to 2048 px (no detail lost at HIGH resolution), request size checked. |
+| **Stale-report guard** | Changing the images clears the old report, so a report is never shown beside different images. |
+| **Live model list** | Models are fetched from Google, so retired IDs disappear automatically. |
+
+## Measuring accuracy — `eval/`
+
+Opinions about accuracy are cheap; measure it. Put de-identified images with known diagnoses in
+`eval/cases/` (git-ignored), list them in `eval/cases.csv` (copy `eval/cases_template.csv`), then:
+
+```bash
+python eval/run_eval.py --model gemini-3.6-flash
+python eval/run_eval.py --model gemini-3.6-flash --two-pass
+```
+
+It reports top-1 / top-3 diagnosis accuracy, urgency agreement, **under-triage** (the dangerous
+error) and critical-finding recall, and saves a CSV per run so you can compare models and settings.
+
 ---
+
 
 ## Do I need my own AI model API? — Yes.
 
@@ -134,28 +165,17 @@ Your browser opens at <http://localhost:8501>.
 
 ## How to use it
 
-1. Upload one or more images in the sidebar (JPEG, PNG, WebP, GIF — max 20 MB each).
+1. Upload one or more images (JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC — max 25 MB each) and pick the modality.
    Multiple views of the same study go in together and are analysed as one case.
 2. Add clinical history if you have it — age, sex, symptoms, duration, relevant labs.
    This measurably sharpens the differential diagnosis.
-3. Click **Generate clinical report** and wait 20–60 seconds.
-4. Read the sectioned report, then **Download PDF**.
+3. Click **Generate clinical report** and wait 20–90 seconds.
+4. Read the report beside the image, then **Download PDF**.
 
 **DICOM files:** the Gemini API doesn't accept `.dcm` directly. Export as PNG or JPEG from your
 PACS viewer (Horos, RadiAnt, 3D Slicer, Weasis) first.
 
 ---
-
-## What changed from the React version
-
-| React app | This Streamlit app |
-|---|---|
-| API key blank, filled by host environment | Server-side secret (`GEMINI_API_KEY`) |
-| `gemini-2.5-flash-preview-09-2025` (preview, now retired) | `gemini-3.6-flash` default, five other options |
-| Browser print dialog | Proper downloadable PDF, with an image appendix |
-| — | Optional clinical history field fed to the model |
-| — | Optional passcode gate to protect your API quota |
-| — | `media_resolution` control (HIGH by default for radiology) |
 
 ## Which model should I pick?
 
@@ -193,9 +213,6 @@ So the binding constraint on the free tier is almost always **requests per day**
 One study = one request, regardless of how many views you upload together (up to 3,600 images
 per request). Batching four views of the same study into one analysis costs one request, not four.
 
-Everything else is a faithful port: the same clinical system prompt, temperature 0 for
-reproducibility, exponential-backoff retries, sectioned rendering, probability and score pills,
-and the confidence and urgency badges.
 
 ---
 
@@ -216,4 +233,4 @@ redeploys itself. No terminal needed.
 
 ## License
 
-MIT
+MIT · © 2026 Dr. Shantanu Samanta

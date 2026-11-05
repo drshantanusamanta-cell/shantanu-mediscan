@@ -1,222 +1,204 @@
 """
 MediScan AI — Clinical Medical Image Interpreter (Streamlit)
-============================================================
-A Streamlit port of the original React app. Uploads one or more medical images,
-sends them to Google's Gemini vision model with a strict clinical reporting
-system prompt, and renders a structured, sectioned clinical report with
-confidence / urgency badges and a downloadable PDF.
+=============================================================
+Designed & developed by Dr. Shantanu Samanta.
+
+Upload one or more medical images, optionally add clinical history and the
+modality, and get a structured clinical report from Google's Gemini vision
+models: systematic findings, critical findings, impression, differential
+diagnosis by likelihood tier, recommendations with urgency, and a self-rated
+confidence — plus a branded PDF.
 
 RESEARCH & EDUCATIONAL USE ONLY. Not a medical device.
 """
 
-import base64
 import hmac
-import io
+import html
 import os
-import re
 import time
 from datetime import datetime
 
-import requests
 import streamlit as st
 from dotenv import load_dotenv
 
-# ── PDF generation ───────────────────────────────────────────────────────────
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_LEFT
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import mm
-from reportlab.platypus import (
-    HRFlowable,
-    Image as RLImage,
-    PageBreak,
-    Paragraph,
-    SimpleDocTemplate,
-    Spacer,
-    Table,
-    TableStyle,
-)
+import mediscan_core as core
+from pdf_report import build_pdf
 
 load_dotenv()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. PAGE CONFIG  (must be the first Streamlit call)
-# ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="MediScan AI — Clinical Image Interpreter",
-    page_icon="🏥",
+    page_title="MediScan AI — Dr. Shantanu Samanta",
+    page_icon="🩺",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. CONSTANTS
-# ─────────────────────────────────────────────────────────────────────────────
+AUTHOR = core.AUTHOR
+YEAR = datetime.now().year
 
-SYSTEM_PROMPT = """You are a clinical AI assistant with expertise equivalent to a board-certified radiologist, neurophysiologist, cardiologist, and clinical specialist. Analyze medical images with clinical precision.
-
-CRITICAL DIRECTIVES FOR CONSISTENCY AND ACCURACY:
-1. ZERO HALLUCINATION: Only report findings strictly visible in the image. Do not guess.
-2. MISSING DATA: If an anatomical structure is obscured, truncated, or out of frame, explicitly state "Not visualized" or "Suboptimal evaluation due to [reason]".
-3. DETERMINISTIC ALIGNMENT: Base your analysis purely on objective visual evidence.
-
-When presented with a medical image, generate a structured clinical report using EXACTLY this format:
-
-## IMAGE IDENTIFICATION
-Identify: image modality (X-Ray / CT Scan / MRI / EEG / ECG / etc.), anatomical region, view/sequence, laterality, and estimated patient demographic if discernible.
-
-## TECHNICAL QUALITY
-Assess image quality (Excellent / Good / Adequate / Poor). Note: exposure, contrast, resolution, positioning accuracy, motion artefacts, noise, equipment artefacts, and any limitations that may affect interpretive accuracy.
-
-## SYSTEMATIC FINDINGS
-Provide a detailed, systematic analysis:
-- Quantify: Provide precise estimated measurements (e.g., dimensions in mm/cm), density/echogenicity, and specific signal characteristics.
-- Terminology: Mandate the use of standardized clinical lexicons where applicable (e.g., BI-RADS, PI-RADS, LI-RADS, TI-RADS, Fleischner Society criteria).
-- Negative Findings: Explicitly state the absence of critical expected pathologies (e.g., "No evidence of acute hemorrhage or midline shift").
-- For Radiology: organ-by-organ or region-by-region review. Describe margins, location, and associated features.
-- For Electrophysiology (EEG/ECG/EMG): detail specific wave morphologies, rhythms, latencies, amplitudes, and conduction velocities.
-
-## IMPRESSION
-Numbered list of key findings in decreasing order of clinical significance. Be specific and clinically actionable.
-
-## DIFFERENTIAL DIAGNOSIS
-Numbered list of the most probable diagnoses in decreasing order of likelihood.
-CRITICAL: You MUST include an estimated probability percentage for EVERY differential diagnosis (e.g., "1. Bacterial Pneumonia [85%] - Supported by...").
-
-## RECOMMENDATIONS
-Clinical next steps. Include: additional imaging if indicated, laboratory workup, clinical correlation requirements, and specialist referral if needed.
-State urgency: Routine / Semi-Urgent (within 1 week) / Urgent (within 24-48 h) / Emergency (immediate action required).
-
-## AI CONFIDENCE LEVEL
-State: [High / Medium / Low] (Score: X/10)
-Explain: Detail factors affecting confidence, such as image resolution, typical vs. atypical presentation, lack of clinical history, and where human clinical judgement is especially critical.
-
----
-
-IMPORTANT DISCLAIMER: This report is generated by an artificial intelligence system for educational and research-assistive purposes only. It is NOT a substitute for professional medical evaluation, clinical diagnosis, or radiological reporting. All findings MUST be reviewed, verified, and clinically correlated by a licensed radiologist, neurophysiologist, or appropriate medical specialist before any clinical decision is made. Never act on AI-generated findings without qualified physician oversight."""
-
-SECTION_META = {
-    "IMAGE IDENTIFICATION": ("🔍", "#60a5fa"),
-    "TECHNICAL QUALITY": ("⚙️", "#a78bfa"),
-    "SYSTEMATIC FINDINGS": ("📊", "#34d399"),
-    "IMPRESSION": ("💡", "#fbbf24"),
-    "DIFFERENTIAL DIAGNOSIS": ("🧬", "#fb923c"),
-    "RECOMMENDATIONS": ("📋", "#38bdf8"),
-    "AI CONFIDENCE LEVEL": ("🎯", "#f472b6"),
-}
-
-# Free-tier availability per https://ai.google.dev/gemini-api/docs/pricing
-# "Free of charge" = usable on a free API key. Pro-preview tiers are paid-only.
-MODELS = {
-    "Gemini 3.6 Flash — newest, best free option ★": ("gemini-3.6-flash", True),
-    "Gemini 3.5 Flash — free": ("gemini-3.5-flash", True),
-    "Gemini 3.5 Flash-Lite — free, fastest, weakest": ("gemini-3.5-flash-lite", True),
-    "Gemini 2.5 Flash — free, older generation": ("gemini-2.5-flash", True),
-    "Gemini 2.5 Pro — free, older but strong reasoning": ("gemini-2.5-pro", True),
-    "Gemini 3.1 Pro Preview — PAID ONLY, strongest": ("gemini-3.1-pro-preview", False),
-}
-
-# Tokens charged per image (Gemini 3 family). HIGH is Google's recommended
-# setting for image analysis and matters a great deal for fine radiological
-# detail — nodules, line placement, subtle infiltrates.
 MEDIA_RESOLUTIONS = {
-    "High — recommended for radiology (≈1120 tokens/image)": "MEDIA_RESOLUTION_HIGH",
-    "Medium — half the tokens (≈560)": "MEDIA_RESOLUTION_MEDIUM",
-    "Low — cheapest, loses fine detail (≈280)": "MEDIA_RESOLUTION_LOW",
+    "High — recommended for radiology": "MEDIA_RESOLUTION_HIGH",
+    "Medium — half the tokens": "MEDIA_RESOLUTION_MEDIUM",
+    "Low — cheapest, loses fine detail": "MEDIA_RESOLUTION_LOW",
     "Model default": "MEDIA_RESOLUTION_UNSPECIFIED",
 }
-
-MODALITIES = [
-    "X-Ray", "CT Scan", "MRI", "EEG", "EMG / NCV", "ECG",
-    "Ultrasound", "Fundoscopy", "Histopathology", "PET Scan", "DEXA",
-]
-
-MAX_FILE_MB = 20
-ACCEPTED_TYPES = ["jpg", "jpeg", "png", "webp", "gif"]
+ACCEPTED_TYPES = ["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"] + (
+    ["heic", "heif"] if core.HEIF_OK else []
+)
+MAX_FILE_MB = 25
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. STYLING
+# Styling — light blue/violet, easy on the eyes
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.markdown(
     """
 <style>
-  .stApp { background: #070c18; }
-  section[data-testid="stSidebar"] { background: #080d1a; border-right: 1px solid #1a2840; }
-  .ms-header {
-      background: linear-gradient(135deg, #0b1628 0%, #0d1f3c 100%);
-      border: 1px solid #1a2840; border-radius: 14px;
-      padding: 16px 20px; margin-bottom: 18px;
-      display: flex; align-items: center; gap: 14px;
+  :root {
+    --ink: #1e2a4a; --muted: #4f5b7a; --soft: #6b7593;
+    --indigo: #4b4fc4; --violet: #7a5fd6; --line: #d6daf3;
+    --card: rgba(255,255,255,.86);
+  }
+  .stApp {
+    background: linear-gradient(135deg, #e6f0ff 0%, #ece9ff 45%, #f3ecff 100%) fixed;
+    color: var(--ink);
+  }
+  section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #eef3ff 0%, #f1ecff 100%);
+    border-right: 1px solid var(--line);
+  }
+  header[data-testid="stHeader"] { background: transparent; }
+  /* Keep the image in view while scrolling the report (wide screens) */
+  @media (min-width: 900px) {
+    div[data-testid="stColumn"]:has(div.st-key-card_viewer) {
+      position: sticky; top: 3.75rem; align-self: flex-start;
+    }
+  }
+  @media (max-width: 640px) {
+    .ms-author { margin-left: 0; text-align: left; width: 100%; }
+    .ms-brand { padding: 14px 16px; }
+  }
+
+  /* Brand header & footer */
+  .ms-brand {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    background: var(--card); border: 1px solid var(--line); border-radius: 18px;
+    padding: 16px 22px; margin-bottom: 18px;
+    box-shadow: 0 6px 24px rgba(91, 79, 196, .08);
   }
   .ms-logo {
-      width: 44px; height: 44px; border-radius: 12px; flex-shrink: 0;
-      background: linear-gradient(135deg, #2563eb, #1e40af);
-      display: flex; align-items: center; justify-content: center;
-      font-size: 22px; box-shadow: 0 0 20px rgba(37,99,235,.4);
+    width: 48px; height: 48px; border-radius: 14px; flex-shrink: 0;
+    background: linear-gradient(135deg, #5b8def, #8a6ae0);
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-size: 24px; box-shadow: 0 4px 14px rgba(122, 95, 214, .35);
   }
-  .ms-title { font-size: 19px; font-weight: 800; color: #e2e8f0; letter-spacing: -.3px; line-height: 1.2; }
-  .ms-title span { color: #3b82f6; }
-  .ms-sub { font-size: 11.5px; color: #94a3b8; margin-top: 3px; }
-  .ms-pill {
-      margin-left: auto; padding: 5px 13px; border-radius: 999px;
-      background: rgba(16,185,129,.10); border: 1px solid rgba(16,185,129,.25);
-      color: #10b981; font-size: 10px; font-weight: 800; letter-spacing: 1.4px; white-space: nowrap;
+  .ms-title { font-size: 22px; font-weight: 800; color: var(--ink); letter-spacing: -.3px; line-height: 1.15; }
+  .ms-title span { color: var(--violet); }
+  .ms-sub { font-size: 13px; color: var(--muted); margin-top: 3px; }
+  .ms-author { margin-left: auto; text-align: right; }
+  .ms-author-k { font-size: 11px; color: var(--soft); letter-spacing: 1.2px; text-transform: uppercase; }
+  .ms-author-n {
+    font-size: 18px; font-weight: 800; letter-spacing: -.2px;
+    background: linear-gradient(90deg, #3f5bd6, #7a4fd0);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
   }
-  .ms-card {
-      background: #0c1525; border: 1px solid #1a2840;
-      border-radius: 14px; padding: 22px 26px; margin-bottom: 14px;
+  .ms-footer {
+    margin-top: 34px; padding: 18px 10px 6px; border-top: 1px solid var(--line);
+    text-align: center; color: var(--muted); font-size: 13px; line-height: 1.7;
   }
-  .ms-sec-head {
-      display: flex; align-items: center; gap: 10px;
-      padding-bottom: 8px; margin-bottom: 12px; border-bottom: 1px solid rgba(30,45,69,.6);
+  .ms-footer b { color: var(--indigo); }
+
+  /* Cards (bordered containers with a key starting "card") */
+  div[class*="st-key-card"] {
+    background: var(--card); border-radius: 16px !important;
+    box-shadow: 0 4px 18px rgba(91, 79, 196, .06);
   }
-  .ms-sec-label { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.8px; }
-  .ms-badge {
-      margin-left: auto; padding: 3px 11px; border-radius: 999px;
-      font-size: 10px; font-weight: 800; letter-spacing: .6px; border: 1px solid;
-  }
-  .ms-body { font-size: 14px; line-height: 1.75; color: #cbd5e1; }
-  .ms-body strong { color: #e2e8f0; }
-  .ms-prob {
-      color: #60a5fa; font-weight: 700; background: rgba(59,130,246,.10);
-      border: 1px solid rgba(59,130,246,.22); padding: 1px 7px;
-      border-radius: 5px; font-size: 11.5px; margin: 0 2px;
-  }
-  .ms-score {
-      color: #34d399; font-weight: 700; background: rgba(16,185,129,.10);
-      border: 1px solid rgba(16,185,129,.22); padding: 1px 7px;
-      border-radius: 5px; font-size: 11.5px; margin: 0 2px;
-  }
-  .ms-disclaimer {
-      background: rgba(239,68,68,.08); border: 1px solid rgba(239,68,68,.22);
-      border-radius: 10px; padding: 14px 16px; color: #fca5a5;
-      font-size: 12px; line-height: 1.7; margin-top: 18px;
-  }
-  .ms-empty { text-align: center; padding: 70px 20px; }
-  .ms-empty-icon { font-size: 74px; opacity: .10; }
-  .ms-empty-title { color: #1e3a5f; font-size: 19px; font-weight: 700; margin-top: 10px; }
-  .ms-empty-text { color: #475569; font-size: 13.5px; margin-top: 8px; }
-  .ms-chip {
-      display: inline-block; padding: 4px 9px; margin: 0 4px 5px 0;
-      background: #080d18; border: 1px solid #1a2840;
-      border-radius: 5px; font-size: 10.5px; color: #94a3b8;
-  }
-  .ms-meta { color: #64748b; font-size: 12px; margin-bottom: 14px; }
-  div[data-testid="stMetricValue"] { font-size: 20px; }
+  .ms-sec { font-size: 13px; font-weight: 800; letter-spacing: 1.2px; text-transform: uppercase;
+            color: var(--indigo); margin: 2px 0 10px; }
+  .ms-body { font-size: 15px; line-height: 1.7; color: var(--ink); }
+  .ms-muted { color: var(--muted); font-size: 13.5px; }
+
+  /* Pills / badges */
+  .pill { display: inline-block; padding: 3px 11px; border-radius: 999px; font-size: 12.5px;
+          font-weight: 700; border: 1px solid; white-space: nowrap; }
+  .p-red    { color: #b42318; background: #fde8e7; border-color: #f4a49d; }
+  .p-orange { color: #b54708; background: #fff1e6; border-color: #f8c49a; }
+  .p-amber  { color: #8a5a00; background: #fef7e0; border-color: #f2d27a; }
+  .p-green  { color: #22704a; background: #e7f5ee; border-color: #9fd6b8; }
+  .p-grey   { color: #4f5b7a; background: #eef0f6; border-color: #cfd4e4; }
+  .p-violet { color: #5b3fc0; background: #efeafd; border-color: #c9bdf2; }
+
+  /* Summary strip */
+  .ms-sum { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+  .ms-sum-k { font-size: 11.5px; color: var(--soft); letter-spacing: 1px; text-transform: uppercase; }
+  .ms-sum-v { font-size: 16px; font-weight: 700; color: var(--ink); margin-top: 5px; }
+  .ms-crit { background: #fde8e7; border: 1px solid #f4a49d; border-radius: 12px;
+             padding: 12px 16px; color: #8f1d14; margin-top: 12px; font-size: 14.5px; }
+  .ms-crit b { color: #b42318; }
+  .ms-warn { background: #fef7e0; border: 1px solid #f2d27a; border-radius: 12px;
+             padding: 10px 14px; color: #6b4a00; margin-bottom: 10px; font-size: 14px; }
+
+  /* Findings table */
+  table.ms-t { width: 100%; border-collapse: collapse; font-size: 14px; }
+  table.ms-t th { text-align: left; color: var(--soft); font-size: 11.5px; letter-spacing: 1px;
+                  text-transform: uppercase; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  table.ms-t td { padding: 8px; border-bottom: 1px solid #e7e9f6; vertical-align: top; color: var(--ink); }
+  table.ms-t td:first-child { font-weight: 600; width: 24%; }
+  .ms-dx { padding: 10px 0; border-bottom: 1px solid #e7e9f6; }
+  .ms-dx:last-child { border-bottom: none; }
+  .ms-dx-n { font-weight: 700; font-size: 15px; color: var(--ink); }
+  .ms-dx-d { font-size: 13.5px; color: var(--muted); margin-top: 4px; line-height: 1.6; }
+
+  /* Empty state */
+  .ms-empty { text-align: center; padding: 34px 20px 10px; }
+  .ms-empty-icon { font-size: 52px; }
+  .ms-empty-title { color: var(--ink); font-size: 20px; font-weight: 700; margin-top: 8px; }
+  .ms-empty-text { color: var(--muted); font-size: 14.5px; margin-top: 6px; }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. AUTH (optional passcode gate — only active if APP_PASSCODE secret is set)
-# ─────────────────────────────────────────────────────────────────────────────
 
+def h(text) -> str:
+    """Escape model text before it goes into HTML."""
+    return html.escape(str(text or ""))
+
+
+def brand_header(subtitle: str = "Clinical medical image interpreter · powered by Gemini"):
+    st.markdown(
+        f"""
+<div class="ms-brand">
+  <div class="ms-logo">🩺</div>
+  <div>
+    <div class="ms-title">MediScan <span>AI</span></div>
+    <div class="ms-sub">{h(subtitle)}</div>
+  </div>
+  <div class="ms-author">
+    <div class="ms-author-k">Designed &amp; developed by</div>
+    <div class="ms-author-n">{h(AUTHOR)}</div>
+  </div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def brand_footer():
+    st.markdown(
+        f"""
+<div class="ms-footer">
+  <b>MediScan AI</b> · Designed &amp; developed by <b>{h(AUTHOR)}</b> · © {YEAR} All rights reserved<br/>
+  For education and research only — not a medical device. Every report must be reviewed by a qualified physician.
+</div>""",
+        unsafe_allow_html=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config & optional passcode gate
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_secret(name: str, default: str = "") -> str:
-    """Read a config value from Streamlit secrets first, then env vars."""
     try:
         if name in st.secrets:
             return str(st.secrets[name])
@@ -225,25 +207,11 @@ def get_secret(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
-def check_passcode() -> bool:
-    """Gate the app behind a shared passcode if APP_PASSCODE is configured.
-
-    Because the Gemini API key is baked in as a server-side secret, every
-    analysis is billed to the app owner. Set APP_PASSCODE to stop strangers
-    from spending your quota. Leave it unset for an open app.
-    """
+def check_passcode():
     expected = get_secret("APP_PASSCODE")
-    if not expected:
-        return True
-    if st.session_state.get("ms_authed"):
-        return True
-
-    st.markdown(
-        '<div class="ms-header"><div class="ms-logo">🏥</div>'
-        '<div><div class="ms-title">MediScan <span>AI</span></div>'
-        '<div class="ms-sub">Access restricted</div></div></div>',
-        unsafe_allow_html=True,
-    )
+    if not expected or st.session_state.get("ms_authed"):
+        return
+    brand_header("Access restricted — enter the passcode to continue")
     entered = st.text_input("Passcode", type="password", key="ms_pass_input")
     if entered:
         if hmac.compare_digest(entered, expected):
@@ -251,508 +219,357 @@ def check_passcode() -> bool:
             st.rerun()
         else:
             st.error("Incorrect passcode.")
+    brand_footer()
     st.stop()
-    return False
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def cached_models(api_key: str) -> list:
+    return core.list_models(api_key)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. GEMINI API CALL
+# Badges
 # ─────────────────────────────────────────────────────────────────────────────
 
-GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+URG_CLASS = {"Emergency": ("p-red", "Emergency — immediate"), "Urgent": ("p-orange", "Urgent — 24–48 h"),
+             "Semi-urgent": ("p-amber", "Semi-urgent — within 1 week"), "Routine": ("p-green", "Routine")}
+CONF_CLASS = {"High": "p-green", "Medium": "p-amber", "Low": "p-red"}
+STATUS_CLASS = {"Normal": "p-green", "Abnormal": "p-red", "Equivocal": "p-amber"}
+LIK_CLASS = {"Most likely": "p-violet", "Likely": "p-violet", "Possible": "p-grey",
+             "Less likely": "p-grey", "Must exclude": "p-orange"}
 
 
-def call_gemini(model: str, api_key: str, images: list, clinical_history: str = "",
-                media_resolution: str = "MEDIA_RESOLUTION_HIGH") -> str:
-    """Send images (+ optional history) to Gemini and return the report text.
+def urgency_pill(level: str) -> str:
+    cls, label = URG_CLASS.get(level, ("p-grey", level or "Not stated"))
+    return f'<span class="pill {cls}">{h(label)}</span>'
 
-    `images` is a list of dicts: {"data": bytes, "mime": str, "name": str}
-    Retries with exponential backoff on transient (5xx / 429) failures.
-    """
-    user_text = "Analyze these medical images and generate a comprehensive structured clinical report."
-    if clinical_history.strip():
-        user_text += (
-            "\n\nRELEVANT CLINICAL HISTORY PROVIDED BY THE CLINICIAN "
-            "(use it to sharpen the differential, but do NOT let it override "
-            "what is actually visible in the image):\n"
-            f"{clinical_history.strip()}"
+
+def conf_pill(level: str) -> str:
+    return f'<span class="pill {CONF_CLASS.get(level, "p-grey")}">{h(level or "Not stated")}</span>'
+
+
+def bullets_html(items) -> str:
+    items = [i for i in (items or []) if str(i).strip()]
+    if not items:
+        return '<div class="ms-muted">None stated.</div>'
+    return '<ul class="ms-body" style="margin:0 0 0 1.1em;padding:0">' + "".join(
+        f"<li>{h(i)}</li>" for i in items) + "</ul>"
+
+
+def card(key: str, title: str, body_html: str):
+    with st.container(border=True, key=f"card_{key}"):
+        st.markdown(f'<div class="ms-sec">{h(title)}</div>{body_html}', unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Report rendering
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_summary(report: dict, warnings: list):
+    for w in warnings:
+        st.markdown(f'<div class="ms-warn">⚠️ {h(w)}</div>', unsafe_allow_html=True)
+    urg, conf = core.urgency_of(report), core.confidence_of(report)
+    q = core.g(report, "quality", "rating") or "—"
+    idn = report.get("identification", {})
+    crit = report.get("critical_findings") or []
+    crit_html = ""
+    if crit:
+        crit_html = '<div class="ms-crit"><b>🚨 Critical findings</b><ul style="margin:6px 0 0 1.1em;padding:0">' + \
+            "".join(f"<li>{h(c)}</li>" for c in crit) + "</ul></div>"
+    with st.container(border=True, key="card_summary"):
+        st.markdown(
+            f"""
+<div class="ms-sum">
+  <div><div class="ms-sum-k">Urgency</div><div class="ms-sum-v">{urgency_pill(urg)}</div></div>
+  <div><div class="ms-sum-k">Leading diagnosis</div><div class="ms-sum-v">{h(core.top_differential(report) or '—')}</div></div>
+  <div><div class="ms-sum-k">Study</div><div class="ms-sum-v">{h(idn.get('modality', ''))} · {h(idn.get('region', ''))}</div></div>
+  <div><div class="ms-sum-k">Image quality</div><div class="ms-sum-v">{h(q)}</div></div>
+  <div><div class="ms-sum-k">Confidence (self-rated)</div><div class="ms-sum-v">{conf_pill(conf)}</div></div>
+</div>{crit_html}""",
+            unsafe_allow_html=True,
         )
 
-    parts = [{"text": user_text}]
-    for img in images:
-        parts.append(
-            {
-                "inlineData": {
-                    "mimeType": img["mime"],
-                    "data": base64.b64encode(img["data"]).decode("utf-8"),
-                }
-            }
-        )
 
-    gen_config = {"temperature": 0.0, "topK": 1, "topP": 0.1}
-    if media_resolution and media_resolution != "MEDIA_RESOLUTION_UNSPECIFIED":
-        gen_config["mediaResolution"] = media_resolution
+def render_report(report: dict, blind: dict | None):
+    idn = report.get("identification", {})
+    q = report.get("quality", {})
+    card("id", "Image identification & quality",
+         f"""<div class="ms-body">
+<b>Modality:</b> {h(idn.get('modality'))} &nbsp;·&nbsp; <b>Region:</b> {h(idn.get('region'))}<br/>
+<b>View / sequence:</b> {h(idn.get('view'))} &nbsp;·&nbsp; <b>Laterality:</b> {h(idn.get('laterality'))}
+{('<br/><b>Notes:</b> ' + h(idn.get('notes'))) if idn.get('notes') else ''}
+<div style="margin-top:10px"><b>Quality:</b> {h(q.get('rating'))}</div></div>
+{bullets_html(q.get('issues'))}
+{('<div class="ms-muted" style="margin-top:6px">' + h(q.get('impact')) + '</div>') if q.get('impact') else ''}""")
 
-    payload = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "generationConfig": gen_config,
-        "contents": [{"role": "user", "parts": parts}],
-    }
-
-    url = GEMINI_ENDPOINT.format(model=model)
-    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
-
-    last_error = None
-    for attempt in range(5):
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=240)
-
-            if resp.status_code == 200:
-                data = resp.json()
-                candidates = data.get("candidates") or []
-                if not candidates:
-                    fb = data.get("promptFeedback", {}).get("blockReason")
-                    raise RuntimeError(
-                        f"The model returned no content (blocked: {fb})."
-                        if fb
-                        else "The model returned no content. Try a different image."
-                    )
-                cand = candidates[0]
-                chunks = [
-                    p["text"] for p in cand.get("content", {}).get("parts", []) if "text" in p
-                ]
-                if not chunks:
-                    raise RuntimeError(
-                        f"Empty response (finishReason: {cand.get('finishReason', 'unknown')})."
-                    )
-                return "".join(chunks)
-
-            # Non-retryable client errors — surface immediately.
-            if resp.status_code in (400, 401, 403, 404):
-                try:
-                    msg = resp.json()["error"]["message"]
-                except Exception:
-                    msg = resp.text[:400]
-                raise RuntimeError(f"API error {resp.status_code}: {msg}")
-
-            last_error = RuntimeError(f"API error {resp.status_code}: {resp.text[:300]}")
-
-        except requests.exceptions.Timeout:
-            last_error = RuntimeError("Request timed out. Try fewer or smaller images.")
-        except requests.exceptions.RequestException as exc:
-            last_error = RuntimeError(f"Network error: {exc}")
-
-        if attempt < 4:
-            time.sleep(2 ** attempt)
-
-    raise last_error or RuntimeError("Unknown error contacting the Gemini API.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. REPORT PARSING & RENDERING
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def parse_report(text: str) -> list:
-    """Split raw markdown-ish report text into [(header, [lines]), ...]."""
-    sections, header, lines = [], None, []
-    for line in text.split("\n"):
-        if line.startswith("## "):
-            if header is not None or any(l.strip() for l in lines):
-                sections.append((header, lines))
-            header, lines = line[3:].strip(), []
-        else:
-            lines.append(line)
-    if header is not None or any(l.strip() for l in lines):
-        sections.append((header, lines))
-    return sections
-
-
-def confidence_badge(body: str):
-    up = body.upper()
-    level = "HIGH" if "HIGH" in up else "MEDIUM" if "MEDIUM" in up else "LOW"
-    style = {
-        "HIGH": "background:rgba(16,185,129,.15);border-color:rgba(16,185,129,.35);color:#34d399;",
-        "MEDIUM": "background:rgba(245,158,11,.15);border-color:rgba(245,158,11,.35);color:#fbbf24;",
-        "LOW": "background:rgba(239,68,68,.15);border-color:rgba(239,68,68,.35);color:#fca5a5;",
-    }[level]
-    return f'<span class="ms-badge" style="{style}">● {level}</span>'
-
-
-def urgency_badge(body: str):
-    up = body.upper()
-    if "EMERGENCY" in up:
-        return ('<span class="ms-badge" style="background:rgba(239,68,68,.15);'
-                'border-color:rgba(239,68,68,.45);color:#fca5a5;">🚨 EMERGENCY</span>')
-    if "SEMI-URGENT" in up or "SEMI URGENT" in up:
-        return ('<span class="ms-badge" style="background:rgba(245,158,11,.15);'
-                'border-color:rgba(245,158,11,.45);color:#fbbf24;">⚠️ SEMI-URGENT</span>')
-    if "URGENT" in up:
-        return ('<span class="ms-badge" style="background:rgba(249,115,22,.15);'
-                'border-color:rgba(249,115,22,.45);color:#fdba74;">⚡ URGENT</span>')
-    if "ROUTINE" in up:
-        return ('<span class="ms-badge" style="background:rgba(100,116,139,.15);'
-                'border-color:rgba(100,116,139,.4);color:#94a3b8;">● ROUTINE</span>')
-    return ""
-
-
-def highlight_inline(text: str) -> str:
-    """Wrap [85%] probabilities and (Score: 8/10) in coloured pills."""
-    text = re.sub(r"\[(\d{1,3})\s*%\]", r'<span class="ms-prob">[\1%]</span>', text)
-    text = re.sub(
-        r"\(Score:\s*(\d{1,2})\s*/\s*10\)",
-        r'<span class="ms-score">(Score: \1/10)</span>',
-        text,
+    rows = "".join(
+        f"<tr><td>{h(f.get('area'))}</td>"
+        f"<td><span class='pill {STATUS_CLASS.get(f.get('status'), 'p-grey')}'>{h(f.get('status'))}</span></td>"
+        f"<td>{h(f.get('observation'))}</td></tr>"
+        for f in report.get("findings", [])
     )
-    return text
+    card("findings", "Systematic findings",
+         f"<table class='ms-t'><tr><th>Area</th><th>Status</th><th>Observation</th></tr>{rows}</table>"
+         f"<div class='ms-muted' style='margin-top:8px'><i>Measurement basis:</i> "
+         f"{h(report.get('measurement_basis'))}</div>")
 
+    if report.get("pertinent_negatives"):
+        card("neg", "Pertinent negatives", bullets_html(report["pertinent_negatives"]))
 
-def render_section(header: str, lines: list):
-    icon, color = SECTION_META.get(header, ("◈", "#60a5fa"))
-    body_raw = "\n".join(lines)
+    imp = report.get("impression", [])
+    card("imp", "Impression",
+         '<ol class="ms-body" style="margin:0 0 0 1.2em;padding:0">' +
+         "".join(f"<li>{h(i)}</li>" for i in imp) + "</ol>" if imp else
+         '<div class="ms-muted">None stated.</div>')
 
-    badge = ""
-    if header == "AI CONFIDENCE LEVEL":
-        badge = confidence_badge(body_raw)
-    elif header == "RECOMMENDATIONS":
-        badge = urgency_badge(body_raw)
-
-    st.markdown(
-        f'<div class="ms-sec-head"><span style="font-size:16px">{icon}</span>'
-        f'<span class="ms-sec-label" style="color:{color}">{header}</span>{badge}</div>',
-        unsafe_allow_html=True,
+    dx = "".join(
+        f"""<div class="ms-dx"><span class="ms-dx-n">{i}. {h(d.get('diagnosis'))}</span>
+ &nbsp;<span class="pill {LIK_CLASS.get(d.get('likelihood'), 'p-grey')}">{h(d.get('likelihood'))}</span>
+<div class="ms-dx-d"><b>For:</b> {h(d.get('supporting'))}<br/><b>Against:</b> {h(d.get('against'))}</div></div>"""
+        for i, d in enumerate(report.get("differentials", []), 1)
     )
+    card("dx", "Differential diagnosis",
+         (dx or '<div class="ms-muted">No differential given.</div>') +
+         '<div class="ms-muted" style="margin-top:8px">Likelihood tiers are the model\'s judgement, '
+         'not calibrated probabilities.</div>')
 
-    # Render markdown body (bullets, numbering, bold) with inline pills
-    body = highlight_inline(body_raw).strip()
-    if body:
-        st.markdown(f'<div class="ms-body">\n\n{body}\n\n</div>', unsafe_allow_html=True)
-    st.write("")
+    card("rec", "Recommendations",
+         bullets_html(report.get("recommendations")) +
+         f'<div style="margin-top:10px">{urgency_pill(core.urgency_of(report))} '
+         f'<span class="ms-muted">{h(core.g(report, "urgency", "rationale"))}</span></div>')
+
+    card("conf", "AI confidence (model self-rated)",
+         f'<div style="margin-bottom:6px">{conf_pill(core.confidence_of(report))}</div>' +
+         bullets_html(core.g(report, "confidence", "reasons", default=[])))
+
+    if report.get("not_assessable"):
+        card("na", "Not assessable on these images", bullets_html(report["not_assessable"]))
+
+    card("hist", "How the clinical history was used",
+         f'<div class="ms-body">{h(report.get("history_integration"))}</div>')
+
+    if blind:
+        with st.expander("Compare with the blind read (before history was given)"):
+            st.markdown(
+                f"""<div class="ms-body">
+<b>Blind read leading diagnosis:</b> {h(core.top_differential(blind) or '—')}<br/>
+<b>Blind read urgency:</b> {urgency_pill(core.urgency_of(blind))}<br/>
+<b>Final leading diagnosis:</b> {h(core.top_differential(report) or '—')}<br/>
+<b>Final urgency:</b> {urgency_pill(core.urgency_of(report))}</div>""",
+                unsafe_allow_html=True,
+            )
+            st.caption("If history moved the diagnosis or urgency a lot, check that the image really supports it.")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. PDF EXPORT
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def esc(text: str) -> str:
-    """Escape for reportlab Paragraph markup, then re-enable **bold**."""
-    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    return text
-
-
-def build_pdf(report: str, model: str, files_meta: list, history: str, images: list) -> bytes:
-    """Render the report to a clean, printable A4 PDF."""
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buf,
-        pagesize=A4,
-        leftMargin=20 * mm,
-        rightMargin=20 * mm,
-        topMargin=18 * mm,
-        bottomMargin=18 * mm,
-        title="MediScan AI Clinical Report",
-        author="MediScan AI",
-    )
-
-    ss = getSampleStyleSheet()
-    navy = colors.HexColor("#1e3a8a")
-
-    s_title = ParagraphStyle("t", parent=ss["Title"], fontSize=17, textColor=navy,
-                             spaceAfter=2, alignment=TA_LEFT)
-    s_meta = ParagraphStyle("m", parent=ss["Normal"], fontSize=8.5,
-                            textColor=colors.HexColor("#6b7280"), leading=12)
-    s_head = ParagraphStyle("h", parent=ss["Normal"], fontSize=10, textColor=navy,
-                            fontName="Helvetica-Bold", spaceBefore=13, spaceAfter=5)
-    s_body = ParagraphStyle("b", parent=ss["Normal"], fontSize=9.5, leading=14.5,
-                            textColor=colors.HexColor("#111827"))
-    s_bullet = ParagraphStyle("bl", parent=s_body, leftIndent=11)
-    s_disc = ParagraphStyle("d", parent=ss["Normal"], fontSize=8, leading=11.5,
-                            textColor=colors.HexColor("#991b1b"))
-
-    flow = [Paragraph("MediScan AI — Clinical Image Report", s_title)]
-
-    stamp = datetime.now().strftime("%d %b %Y, %H:%M")
-    names = ", ".join(f["name"] for f in files_meta) or "—"
-    flow.append(Paragraph(
-        f"Generated: {stamp} &nbsp;·&nbsp; Model: {esc(model)} &nbsp;·&nbsp; "
-        f"Files ({len(files_meta)}): {esc(names)}", s_meta))
-    flow.append(Spacer(1, 5))
-    flow.append(HRFlowable(width="100%", thickness=1.4, color=colors.HexColor("#e5e7eb")))
-
-    if history.strip():
-        flow.append(Paragraph("CLINICAL HISTORY PROVIDED", s_head))
-        for para in history.strip().split("\n"):
-            if para.strip():
-                flow.append(Paragraph(esc(para), s_body))
-
-    disclaimer_lines = []
-    for header, lines in parse_report(report):
-        if header:
-            flow.append(Paragraph(esc(header), s_head))
-            flow.append(HRFlowable(width="100%", thickness=0.4,
-                                   color=colors.HexColor("#e5e7eb"), spaceAfter=5))
-        for line in lines:
-            stripped = line.strip()
-            if not stripped or stripped == "---":
-                continue
-            if "DISCLAIMER" in stripped.upper():
-                disclaimer_lines.append(stripped)
-                continue
-            style = s_bullet if (stripped.startswith(("-", "*", "•"))
-                                 or re.match(r"^\d+[\.\)]", stripped)) else s_body
-            flow.append(Paragraph(esc(stripped), style))
-
-    if not disclaimer_lines:
-        disclaimer_lines = [
-            "IMPORTANT: AI-generated report for educational and research-assistive purposes only. "
-            "Not a substitute for professional medical evaluation. All findings must be reviewed "
-            "and clinically correlated by a licensed specialist before any clinical decision."
-        ]
-
-    flow.append(Spacer(1, 12))
-    disc_tbl = Table(
-        [[Paragraph(esc(" ".join(disclaimer_lines)), s_disc)]],
-        colWidths=[doc.width],
-    )
-    disc_tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fff5f5")),
-        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#fecaca")),
-        ("LEFTPADDING", (0, 0), (-1, -1), 9),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 9),
-        ("TOPPADDING", (0, 0), (-1, -1), 8),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-    ]))
-    flow.append(disc_tbl)
-
-    # Appendix: the analysed images
-    if images:
-        flow.append(PageBreak())
-        flow.append(Paragraph("APPENDIX — ANALYSED IMAGES", s_head))
-        for img, meta in zip(images, files_meta):
-            try:
-                rl = RLImage(io.BytesIO(img["data"]))
-                ratio = rl.imageHeight / float(rl.imageWidth or 1)
-                width = min(doc.width, 120 * mm)
-                rl.drawWidth, rl.drawHeight = width, width * ratio
-                if rl.drawHeight > 150 * mm:
-                    scale = (150 * mm) / rl.drawHeight
-                    rl.drawWidth, rl.drawHeight = rl.drawWidth * scale, 150 * mm
-                flow.append(Spacer(1, 6))
-                flow.append(rl)
-                flow.append(Paragraph(esc(meta["name"]), s_meta))
-            except Exception:
-                flow.append(Paragraph(f"[Could not embed: {esc(meta['name'])}]", s_meta))
-
-    doc.build(flow)
-    return buf.getvalue()
+def render_viewer(images: list):
+    with st.container(border=True, key="card_viewer"):
+        st.markdown('<div class="ms-sec">Image viewer</div>', unsafe_allow_html=True)
+        if not images:
+            st.caption("No images.")
+            return
+        idx = 0
+        if len(images) > 1:
+            idx = st.radio(
+                "View", list(range(len(images))), horizontal=True,
+                format_func=lambda i: f"View {i + 1}", label_visibility="collapsed",
+            )
+        img = images[idx]
+        st.image(img["data"], caption=img["name"], width="stretch")
+        w, hgt = img["size"]
+        ow, oh = img["orig_size"]
+        note = f"Sent to the model at {w}×{hgt}px"
+        if (w, hgt) != (ow, oh):
+            note += f" (original {ow}×{oh}px)"
+        st.caption(note + " · use the ⤢ button on the image for full screen.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. MAIN APP
+# Main
 # ─────────────────────────────────────────────────────────────────────────────
+
+def reset_analysis():
+    for k in ("report", "blind", "warnings", "meta", "images", "pdf", "sig", "md"):
+        st.session_state.pop(k, None)
+    st.session_state["uploader_n"] = st.session_state.get("uploader_n", 0) + 1
 
 
 def main():
     check_passcode()
-
-    st.markdown(
-        '<div class="ms-header">'
-        '<div class="ms-logo">🏥</div>'
-        '<div><div class="ms-title">MediScan <span>AI</span></div>'
-        '<div class="ms-sub">Clinical Medical Image Interpreter · Powered by Gemini</div></div>'
-        '<div class="ms-pill">● RESEARCH / EDUCATIONAL USE ONLY</div>'
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
+    brand_header()
     api_key = get_secret("GEMINI_API_KEY")
 
-    # ── Sidebar ──────────────────────────────────────────────────────────────
+    # ── Sidebar: settings only ───────────────────────────────────────────────
     with st.sidebar:
-        st.markdown("##### 🤖 Analysis model")
-        model_label = st.selectbox("Model", list(MODELS.keys()), label_visibility="collapsed")
-        model, is_free = MODELS[model_label]
-        if not is_free:
-            st.warning("This model has **no free tier** — billing must be enabled.", icon="💳")
-        st.caption("Temperature 0 — tuned for deterministic, reproducible reporting.")
-
-        st.markdown("##### 🔬 Image detail")
-        res_label = st.selectbox(
-            "Media resolution", list(MEDIA_RESOLUTIONS.keys()), label_visibility="collapsed"
-        )
-        media_resolution = MEDIA_RESOLUTIONS[res_label]
-        st.caption("Higher detail costs more tokens but catches subtler findings.")
-
-        st.markdown("##### 🖼️ Medical images")
-        uploads = st.file_uploader(
-            "Upload one or more images",
-            type=ACCEPTED_TYPES,
-            accept_multiple_files=True,
-            label_visibility="collapsed",
-        )
-        st.caption(f"JPEG / PNG / WebP / GIF · max {MAX_FILE_MB} MB each")
-
-        st.markdown("##### 📝 Clinical history *(optional)*")
-        history = st.text_area(
-            "Clinical history",
-            placeholder=(
-                "e.g. 62 y/o male, 40 pack-year smoker. 3 weeks productive cough, "
-                "fever 38.9°C, left-sided pleuritic chest pain. WBC 16,400."
-            ),
-            height=120,
-            label_visibility="collapsed",
-        )
-        st.caption("Age, sex, symptoms, duration, relevant labs. Sharpens the differential.")
-
-        analyse = st.button("🔬 Generate clinical report", type="primary", use_container_width=True)
-
-        if st.session_state.get("report"):
-            if st.button("＋ New analysis", use_container_width=True):
-                for k in ("report", "report_meta", "report_images"):
-                    st.session_state.pop(k, None)
-                st.rerun()
-
+        st.markdown("### ⚙️ Settings")
+        models = cached_models(api_key) if api_key else core.DEFAULT_MODELS
+        model = st.selectbox("Analysis model", models, index=0,
+                             help="List fetched live from Google, so retired models disappear automatically.")
+        if any(x in model for x in core.PAID_ONLY_HINTS):
+            st.warning("Preview Pro models usually need billing enabled.", icon="💳")
+        res_label = st.selectbox("Image detail", list(MEDIA_RESOLUTIONS.keys()), index=0,
+                                 help="High detail catches subtler findings (small nodules, line tips).")
+        two_pass = st.toggle(
+            "Blind read first, then add history", value=False,
+            help="Reads the image without history first, then integrates the history and shows "
+                 "what changed. Reduces anchoring bias. Uses 2 requests instead of 1. "
+                 "Only applies when history is given.")
         st.divider()
-        st.markdown("##### Supported modalities")
-        st.markdown(
-            "".join(f'<span class="ms-chip">{m}</span>' for m in MODALITIES),
-            unsafe_allow_html=True,
-        )
+        st.markdown("**Privacy**")
         st.caption(
-            "DICOM: export as PNG/JPEG from your PACS viewer "
-            "(Horos, RadiAnt, 3D Slicer) before uploading."
-        )
+            "Images are sent to Google's Gemini API. On the free tier Google may use submitted data "
+            "to improve its models. Crop out names, IDs and dates burned into images before uploading. "
+            "EXIF metadata is stripped automatically.")
+        st.markdown("**DICOM**")
+        st.caption("Export as PNG/JPEG from your PACS viewer (RadiAnt, Horos, Weasis, 3D Slicer) first.")
+        if st.session_state.get("report"):
+            st.divider()
+            st.button("＋ New analysis", width="stretch", on_click=reset_analysis)
 
-    # ── Validate & collect uploads ───────────────────────────────────────────
-    images, errors = [], []
+    # ── Input card ───────────────────────────────────────────────────────────
+    with st.container(border=True, key="card_input"):
+        st.markdown('<div class="ms-sec">1 · Study</div>', unsafe_allow_html=True)
+        c1, c2 = st.columns([3, 2], gap="large")
+        with c1:
+            uploads = st.file_uploader(
+                "Medical images — add every view of the same study together",
+                type=ACCEPTED_TYPES, accept_multiple_files=True,
+                key=f"uploader_{st.session_state.get('uploader_n', 0)}",
+            )
+        with c2:
+            modality = st.selectbox(
+                "Modality", list(core.MODALITY_CHECKLISTS.keys()), index=0,
+                help="Choosing the modality gives the model a specialist review checklist, "
+                     "which reduces missed findings.")
+            history = st.text_area(
+                "Clinical history (optional)", height=110,
+                placeholder="e.g. 62 M, smoker, 3 weeks productive cough, fever 38.9°C, "
+                            "left pleuritic pain. WBC 16,400.")
+        analyse_clicked = st.button("🔬 Generate clinical report", type="primary", width="stretch")
+
+    # ── Prepare uploads ──────────────────────────────────────────────────────
+    raw = []
     for f in uploads or []:
         data = f.getvalue()
         if len(data) > MAX_FILE_MB * 1024 * 1024:
-            errors.append(f"**{f.name}** is larger than {MAX_FILE_MB} MB — skipped.")
+            st.warning(f"**{f.name}** is larger than {MAX_FILE_MB} MB — skipped.", icon="⚠️")
             continue
-        images.append({"data": data, "mime": f.type or "image/png", "name": f.name})
+        raw.append((f.name, data))
+    sig = core.uploads_signature([d for _, d in raw]) if raw else None
 
-    for e in errors:
-        st.warning(e, icon="⚠️")
+    # A report must never be shown next to different images
+    if st.session_state.get("report") and sig and sig != st.session_state.get("sig"):
+        for k in ("report", "blind", "warnings", "meta", "images", "pdf", "md"):
+            st.session_state.pop(k, None)
+        st.info("Images changed — the previous report was cleared. Generate a new one.", icon="🔄")
 
-    if images:
-        with st.expander(f"Preview — {len(images)} image(s) ready", expanded=False):
-            cols = st.columns(min(4, len(images)))
-            for i, img in enumerate(images):
-                cols[i % len(cols)].image(img["data"], caption=img["name"], use_container_width=True)
-
-    # ── Run the analysis ─────────────────────────────────────────────────────
-    if analyse:
+    if analyse_clicked:
         if not api_key:
-            st.error(
-                "No Gemini API key configured. Add **GEMINI_API_KEY** to your Space secrets "
-                "(Settings → Variables and secrets) or to `.env` when running locally.",
-                icon="🔑",
-            )
-        elif not images:
+            st.error("No Gemini API key configured. Add **GEMINI_API_KEY** to the app secrets "
+                     "or to `.env` when running locally.", icon="🔑")
+        elif not raw:
             st.error("Upload at least one medical image first.", icon="🖼️")
         else:
-            started = time.time()
-            try:
-                with st.spinner(f"Analysing {len(images)} image(s) with {model} — this can take 20–60 s…"):
-                    report = call_gemini(model, api_key, images, history, media_resolution)
-                st.session_state["report"] = report
-                st.session_state["report_images"] = images
-                st.session_state["report_meta"] = {
-                    "model": model,
-                    "history": history,
-                    "files": [{"name": i["name"]} for i in images],
-                    "when": datetime.now().strftime("%d %b %Y, %H:%M"),
-                    "secs": round(time.time() - started, 1),
-                }
-            except Exception as exc:
-                st.error(f"Analysis failed: {exc}", icon="🚫")
+            images, bad = [], []
+            for name, data in raw:
+                try:
+                    images.append(core.prepare_image(data, name))
+                except Exception:
+                    bad.append(name)
+            for b in bad:
+                st.warning(f"**{b}** could not be opened as an image — skipped.", icon="⚠️")
+            total_mb = sum(len(i["data"]) for i in images) * 4 / 3 / 1024 / 1024
+            if not images:
+                st.error("None of the uploads could be read as images.")
+            elif total_mb > core.MAX_TOTAL_INLINE_MB:
+                st.error(f"Together the images are about {total_mb:.0f} MB after preparation — "
+                         f"too large for one request. Analyse fewer views at a time.")
+            else:
+                started = time.time()
+                passes = "2 passes" if (two_pass and history.strip()) else "1 pass"
+                try:
+                    with st.spinner(f"Reading {len(images)} image(s) with {model} ({passes}) — "
+                                    "usually 20–90 seconds…"):
+                        result = core.analyse(model, api_key, images, history, modality,
+                                              MEDIA_RESOLUTIONS[res_label], two_pass)
+                    meta = {
+                        "model": model, "history": history.strip(), "modality": modality,
+                        "files": [i["name"] for i in images],
+                        "when": datetime.now().strftime("%d %b %Y, %H:%M"),
+                        "secs": round(time.time() - started, 1),
+                        "read_mode": "Blind read + history" if result["blind_report"] else "Single read",
+                        "warnings": result["warnings"], "year": YEAR,
+                    }
+                    st.session_state.update(
+                        report=result["report"], blind=result["blind_report"],
+                        warnings=result["warnings"], meta=meta, images=images, sig=sig,
+                        md=core.report_to_markdown(result["report"], meta),
+                    )
+                    try:
+                        st.session_state["pdf"] = build_pdf(result["report"], meta, images)
+                    except Exception as exc:
+                        st.session_state["pdf"] = None
+                        st.warning(f"PDF could not be built: {exc}")
+                except core.QuotaExhausted as exc:
+                    st.error(str(exc), icon="⏳")
+                except Exception as exc:
+                    st.error(f"Analysis failed: {exc}", icon="🚫")
 
-    # ── Render the report ────────────────────────────────────────────────────
     report = st.session_state.get("report")
 
+    # ── Empty state ──────────────────────────────────────────────────────────
     if not report:
-        st.markdown(
-            '<div class="ms-empty">'
-            '<div class="ms-empty-icon">🩺</div>'
-            '<div class="ms-empty-title">Awaiting image analysis</div>'
-            '<div class="ms-empty-text">Upload a medical image in the sidebar, add clinical '
-            "history if you have it, then click Generate clinical report.</div></div>",
-            unsafe_allow_html=True,
-        )
-        c1, c2, c3 = st.columns(3)
-        for col, (icon, step, label) in zip(
-            (c1, c2, c3),
-            [("🖼️", "1", "Upload image"), ("🔬", "2", "Analyse"), ("📋", "3", "Get report")],
-        ):
-            col.markdown(
-                f'<div class="ms-card" style="text-align:center;padding:20px">'
-                f'<div style="font-size:26px">{icon}</div>'
-                f'<div style="font-size:10px;color:#475569;font-weight:700;'
-                f'letter-spacing:1.6px;margin-top:8px">STEP {step}</div>'
-                f'<div style="font-size:13px;color:#64748b;margin-top:4px">{label}</div></div>',
+        with st.container(border=True, key="card_empty"):
+            st.markdown(
+                '<div class="ms-empty"><div class="ms-empty-icon">🩻</div>'
+                '<div class="ms-empty-title">Awaiting a study</div>'
+                '<div class="ms-empty-text">Upload the images, choose the modality, add any clinical '
+                'history, then generate the report.</div></div>',
                 unsafe_allow_html=True,
             )
+            cols = st.columns(3)
+            for col, (icon, step, label) in zip(cols, [
+                ("🖼️", "1", "Upload every view"), ("🧭", "2", "Pick modality & add history"),
+                ("📋", "3", "Review the report with the image")]):
+                col.markdown(
+                    f'<div style="text-align:center;padding:10px 4px 18px"><div style="font-size:26px">{icon}</div>'
+                    f'<div class="ms-sum-k" style="margin-top:6px">Step {step}</div>'
+                    f'<div class="ms-body" style="font-size:14px">{label}</div></div>',
+                    unsafe_allow_html=True,
+                )
+        brand_footer()
         return
 
-    meta = st.session_state.get("report_meta", {})
-    imgs = st.session_state.get("report_images", [])
-
-    st.markdown("#### AI clinical report")
+    # ── Report ───────────────────────────────────────────────────────────────
+    meta = st.session_state.get("meta", {})
     st.markdown(
-        f'<div class="ms-meta">{meta.get("when", "")} · {meta.get("model", "")} · '
-        f'{len(meta.get("files", []))} file(s) · {meta.get("secs", "?")} s</div>',
+        f'<div class="ms-sec" style="margin-top:8px">2 · Report</div>'
+        f'<div class="ms-muted" style="margin-bottom:10px">{h(meta.get("when"))} · {h(meta.get("model"))} · '
+        f'{h(meta.get("modality"))} · {h(meta.get("read_mode"))} · {len(meta.get("files", []))} file(s) · '
+        f'{meta.get("secs", "?")} s</div>',
         unsafe_allow_html=True,
     )
+    render_summary(report, st.session_state.get("warnings", []))
 
-    d1, d2, _ = st.columns([1, 1, 3])
-    try:
-        pdf_bytes = build_pdf(report, meta.get("model", ""), meta.get("files", []),
-                              meta.get("history", ""), imgs)
-        d1.download_button(
-            "📄 Download PDF",
-            data=pdf_bytes,
-            file_name=f"mediscan_report_{datetime.now():%Y%m%d_%H%M}.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
-    except Exception as exc:
-        d1.warning(f"PDF unavailable: {exc}")
+    left, right = st.columns([2, 3], gap="large")
+    with left:
+        render_viewer(st.session_state.get("images", []))
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        if st.session_state.get("pdf"):
+            st.download_button("📄 Download PDF", data=st.session_state["pdf"],
+                               file_name=f"mediscan_report_{stamp}.pdf", mime="application/pdf",
+                               width="stretch", type="primary")
+        st.download_button("📝 Download text", data=st.session_state.get("md", ""),
+                           file_name=f"mediscan_report_{stamp}.md", mime="text/markdown",
+                           width="stretch")
+    with right:
+        render_report(report, st.session_state.get("blind"))
 
-    d2.download_button(
-        "📝 Download text",
-        data=report,
-        file_name=f"mediscan_report_{datetime.now():%Y%m%d_%H%M}.txt",
-        mime="text/plain",
-        use_container_width=True,
-    )
-
-    with st.container():
-        st.markdown('<div class="ms-card">', unsafe_allow_html=True)
-        for header, lines in parse_report(report):
-            if header:
-                render_section(header, lines)
-            else:
-                leftover = "\n".join(l for l in lines if l.strip() and l.strip() != "---")
-                if leftover and "DISCLAIMER" not in leftover.upper():
-                    st.markdown(f'<div class="ms-body">{leftover}</div>', unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown(
-        '<div class="ms-disclaimer"><b>⚠️ IMPORTANT DISCLAIMER:</b> This report is generated by an '
-        "artificial intelligence system for educational and research-assistive purposes only. It is "
-        "<b>NOT</b> a substitute for professional medical evaluation, clinical diagnosis, or "
-        "radiological reporting. All findings MUST be reviewed, verified, and clinically correlated "
-        "by a licensed radiologist, neurophysiologist, or appropriate medical specialist before any "
-        "clinical decision is made. Never act on AI-generated findings without qualified physician "
-        "oversight.</div>",
-        unsafe_allow_html=True,
-    )
-
-    with st.expander("View raw report text"):
-        st.code(report, language="markdown")
+    st.markdown(f'<div class="ms-warn" style="background:#fff6f4;border-color:#f5c2b8;color:#7a271a">'
+                f'<b>Important:</b> {h(core.DISCLAIMER)}</div>', unsafe_allow_html=True)
+    with st.expander("Raw model output (JSON)"):
+        st.json(report)
+    brand_footer()
 
 
 if __name__ == "__main__":

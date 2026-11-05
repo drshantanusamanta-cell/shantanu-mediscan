@@ -1,0 +1,5 @@
+case_id,files,modality,history,expected_dx,expected_urgency,critical
+cxr_001,cxr_001.png,Chest X-Ray,"28 M, sudden right chest pain and breathlessness",pneumothorax|PTX,Emergency,yes
+ecg_001,ecg_001.jpg,ECG,"58 M, 40 min crushing chest pain",inferior STEMI|inferior myocardial infarction|inferior MI,Emergency,yes
+fundus_001,fundus_001.jpg,Fundus photograph,"52 F, diabetic 12 years",diabetic retinopathy,Semi-urgent,no
+cxr_002,cxr_002_pa.png;cxr_002_lat.png,Chest X-Ray,,normal chest|no acute,Routine,no

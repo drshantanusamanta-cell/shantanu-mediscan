@@ -1,0 +1,8 @@
+.env
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.venv/
+eval/cases/*
+!eval/cases/README.md
+eval/results/
